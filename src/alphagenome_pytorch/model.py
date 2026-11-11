@@ -164,26 +164,26 @@ class TransformerTower(nn.Module):
                 'mlp': mlp
             }))
 
-    def _forward_block(self, block, x, pair_x, compute_dtype):
+    def _forward_block(self, block, x, pair_x, compute_dtype, embedding=None):
         if block['pair_update'] is not None:
-            pair_x = block['pair_update'](x, pair_x, compute_dtype=compute_dtype)
-        mha_bias = block['attn_bias'](pair_x)
-        x = x + block['mha'](x, mha_bias, compute_dtype=compute_dtype)
-        x = x + block['mlp'](x)
+            pair_x = block['pair_update'](x, pair_x, compute_dtype=compute_dtype, embedding=embedding)
+        mha_bias = block['attn_bias'](pair_x, embedding=embedding)
+        x = x + block['mha'](x, mha_bias, compute_dtype=compute_dtype, embedding=embedding)
+        x = x + block['mlp'](x, embedding=embedding)
         return x, pair_x
 
-    def forward(self, x, compute_dtype=None):
-        # x: (B, S, D)
+    def forward(self, x, compute_dtype=None, embedding=None):
+        # x: (B, S, D); embedding: optional (B, d) conditioning for CondLoRA layers
         pair_x = None
 
         for block in self.blocks:
             if self.gradient_checkpointing and torch.is_grad_enabled():
                 x, pair_x = checkpoint(
-                    self._forward_block, block, x, pair_x, compute_dtype,
+                    self._forward_block, block, x, pair_x, compute_dtype, embedding,
                     use_reentrant=False,
                 )
             else:
-                x, pair_x = self._forward_block(block, x, pair_x, compute_dtype)
+                x, pair_x = self._forward_block(block, x, pair_x, compute_dtype, embedding)
 
         return x, pair_x
 
@@ -627,7 +627,7 @@ class AlphaGenome(nn.Module):
             )
         return organism_index
 
-    def _compute_embeddings_ncl(self, dna_sequence, organism_index, resolutions=None):
+    def _compute_embeddings_ncl(self, dna_sequence, organism_index, resolutions=None, embedding=None):
         """Internal method to compute embeddings in NCL format.
 
         Returns:
@@ -648,7 +648,7 @@ class AlphaGenome(nn.Module):
         trunk = trunk + org_emb
 
         # ===== TRANSFORMER (NLC) =====
-        trunk, pair_activations = self.tower(trunk, compute_dtype=self.dtype_policy.compute_dtype)
+        trunk, pair_activations = self.tower(trunk, compute_dtype=self.dtype_policy.compute_dtype, embedding=embedding)
         # trunk: (B, 1024, 1536) NLC
 
         # ===== NLC → NCL for Decoder/Embedders =====
@@ -684,6 +684,7 @@ class AlphaGenome(nn.Module):
         organism_index,
         resolutions=None,
         channels_last=True,
+        embedding=None,
     ):
         """Extract embeddings without running prediction heads.
 
@@ -738,7 +739,7 @@ class AlphaGenome(nn.Module):
 
         with torch.autocast(device_type=device_type, dtype=self.dtype_policy.compute_dtype, enabled=use_amp):
             embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
-                self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
+                self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions, embedding=embedding)
 
         # Build output dict with requested format
         # Use contiguous() after transpose to ensure memory layout is optimal
@@ -771,6 +772,7 @@ class AlphaGenome(nn.Module):
         channels_last=True,
         embeddings_only=False,
         encoder_only=False,
+        embedding=None,
     ):
         """Forward pass through the model.
 
@@ -793,6 +795,9 @@ class AlphaGenome(nn.Module):
             embeddings_only: If True, skip all head computation and only return
                 embeddings. Useful for fine-tuning where only a custom head is used.
                 Implies return_embeddings=True.
+            embedding: Optional per-sample conditioning vector (B, d) forwarded to
+                conditional adapter layers (CondLoRA) inside the transformer tower.
+                Plain layers ignore it. Default None (unconditional).
             encoder_only: If True, run only the CNN encoder (skip organism embedding,
                 transformer, decoder, and heads). Returns raw encoder output in
                 ``{"encoder_output": tensor}`` where tensor has shape (B, S//128, 1536).
@@ -840,7 +845,7 @@ class AlphaGenome(nn.Module):
 
         # Compute embeddings (NCL format internally)
         embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
-            self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
+            self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions, embedding=embedding)
 
         if need_1bp:
             embeddings_dict = {1: embeddings_1bp, 128: embeddings_128bp}

@@ -4,6 +4,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from . import layers
 
+def _lin(layer, x, embedding=None):
+    """Call a linear layer; pass `embedding` only to conditional layers (CondLoRA)."""
+    if embedding is not None and getattr(layer, "is_conditional", False):
+        return layer(x, embedding)
+    return layer(x)
+
+
 _MAX_RELATIVE_DISTANCE = 8192
 
 
@@ -163,7 +170,7 @@ class MHABlock(nn.Module):
         # e.g.: mha.attn_softmax.register_forward_hook(...)
         self.attn_softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, attention_bias, compute_dtype=None):
+    def forward(self, x, attention_bias, compute_dtype=None, embedding=None):
         B, S, D = x.shape
         if compute_dtype is None:
             compute_dtype = x.dtype
@@ -173,9 +180,9 @@ class MHABlock(nn.Module):
 
         h = self.norm(x)
 
-        q = self.norm_q(self.q_proj(h).view(B, S, 8, 128))
-        k = self.norm_k(self.k_proj(h).view(B, S, 1, 128))
-        v = self.norm_v(self.v_proj(h).view(B, S, 1, 192))
+        q = self.norm_q(_lin(self.q_proj, h, embedding).view(B, S, 8, 128))
+        k = self.norm_k(_lin(self.k_proj, h, embedding).view(B, S, 1, 128))
+        v = self.norm_v(_lin(self.v_proj, h, embedding).view(B, S, 1, 192))
 
         q = apply_rope(q, inplace=True)
         k = apply_rope(k, inplace=True)
@@ -202,7 +209,7 @@ class MHABlock(nn.Module):
         y = y.to(compute_dtype)
         y = y.permute(0, 2, 1, 3).reshape(B, S, -1)
 
-        y = self.linear_embedding(y)
+        y = _lin(self.linear_embedding, y, embedding)
         return self.final_norm(y)
 
 class MLPBlock(nn.Module):
@@ -213,10 +220,10 @@ class MLPBlock(nn.Module):
         self.fc2 = nn.Linear(d_model * 2, d_model)
         self.final_norm = layers.RMSBatchNorm(d_model, channels_last=True)
 
-    def forward(self, x):
+    def forward(self, x, embedding=None):
         h = self.norm(x)
-        h = F.relu(self.fc1(h))
-        h = self.fc2(h)
+        h = F.relu(_lin(self.fc1, h, embedding))
+        h = _lin(self.fc2, h, embedding)
         return self.final_norm(h)
 
 class AttentionBiasBlock(nn.Module):
@@ -225,10 +232,10 @@ class AttentionBiasBlock(nn.Module):
         self.norm = layers.RMSBatchNorm(pair_dim, channels_last=True)
         self.proj = nn.Linear(pair_dim, 8, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, embedding=None):
         # x: (B, s, s, D)
         h = F.gelu(self.norm(x))
-        h = self.proj(h) # (B, s, s, 8)
+        h = _lin(self.proj, h, embedding) # (B, s, s, 8)
         # Repeat 16x16
         h = torch.repeat_interleave(h, 16, dim=1)
         h = torch.repeat_interleave(h, 16, dim=2)
@@ -261,7 +268,7 @@ class SequenceToPairBlock(nn.Module):
         
         self.linear_pair = nn.Linear(self.num_heads, self.head_dim) 
 
-    def forward(self, x):
+    def forward(self, x, embedding=None):
         # x: (B, S, D) - NLC format
         # Pool1d expects NCL, so transpose around pool call
         x_pooled = self.pool(x.transpose(1, 2)).transpose(1, 2)
@@ -269,8 +276,8 @@ class SequenceToPairBlock(nn.Module):
         
         B, S_prime, _ = x_norm.shape
         
-        q = self.linear_q(x_norm).view(B, S_prime, self.num_heads, self.head_dim)
-        k = self.linear_k(x_norm).view(B, S_prime, self.num_heads, self.head_dim)
+        q = _lin(self.linear_q, x_norm, embedding).view(B, S_prime, self.num_heads, self.head_dim)
+        k = _lin(self.linear_k, x_norm, embedding).view(B, S_prime, self.num_heads, self.head_dim)
         
         # Relative positions (computed in float32 for precision, then cast to model dtype)
         range_vec = torch.arange(-S_prime, S_prime, device=x.device, dtype=torch.float32)
@@ -295,10 +302,10 @@ class SequenceToPairBlock(nn.Module):
         
         # y branches
         x_gelu = F.gelu(x_norm)
-        y_q = self.linear_y_q(x_gelu)
-        y_k = self.linear_y_k(x_gelu)
-        
-        pair_act = self.linear_pair(a) + y_q.unsqueeze(2) + y_k.unsqueeze(1)
+        y_q = _lin(self.linear_y_q, x_gelu, embedding)
+        y_k = _lin(self.linear_y_k, x_gelu, embedding)
+
+        pair_act = _lin(self.linear_pair, a, embedding) + y_q.unsqueeze(2) + y_k.unsqueeze(1)
         return pair_act
 
 class RowAttentionBlock(nn.Module):
@@ -317,15 +324,15 @@ class RowAttentionBlock(nn.Module):
         # nn.Module allows registering forward hooks to extract attn weights
         self.attn_softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, compute_dtype=None):
+    def forward(self, x, compute_dtype=None, embedding=None):
         if compute_dtype is None:
             compute_dtype = x.dtype
         x = x.to(compute_dtype)
 
         h = self.norm(x)
-        q = self.linear_q(h)
-        k = self.linear_k(h)
-        v = self.linear_v(h)
+        q = _lin(self.linear_q, h, embedding)
+        k = _lin(self.linear_k, h, embedding)
+        v = _lin(self.linear_v, h, embedding)
 
         # Attention: bf16 einsum then cast to f32 (matches JAX BF16_BF16_F32)
         scale = 1.0 / math.sqrt(128.0)
@@ -343,11 +350,11 @@ class PairMLPBlock(nn.Module):
         self.linear1 = nn.Linear(pair_dim, 2 * pair_dim)
         self.linear2 = nn.Linear(2 * pair_dim, pair_dim)
         
-    def forward(self, x):
+    def forward(self, x, embedding=None):
         h = self.norm(x)
-        h = self.linear1(h)
+        h = _lin(self.linear1, h, embedding)
         h = F.relu(h)
-        h = self.linear2(h)
+        h = _lin(self.linear2, h, embedding)
         return h
 
 class PairUpdateBlock(nn.Module):
@@ -357,18 +364,18 @@ class PairUpdateBlock(nn.Module):
         self.row_attn = RowAttentionBlock(pair_dim)
         self.pair_mlp = PairMLPBlock(pair_dim)
 
-    def forward(self, x, pair_rep, compute_dtype=None):
+    def forward(self, x, pair_rep, compute_dtype=None, embedding=None):
         # x: (B, S, D)
         # pair_rep: (B, S/16, S/16, F)
 
-        y = self.seq2pair(x)
+        y = self.seq2pair(x, embedding=embedding)
 
         if pair_rep is None:
             pair_rep = y
         else:
             pair_rep = pair_rep + y
 
-        pair_rep = pair_rep + self.row_attn(pair_rep, compute_dtype=compute_dtype)
-        pair_rep = pair_rep + self.pair_mlp(pair_rep)
+        pair_rep = pair_rep + self.row_attn(pair_rep, compute_dtype=compute_dtype, embedding=embedding)
+        pair_rep = pair_rep + self.pair_mlp(pair_rep, embedding=embedding)
 
         return pair_rep
